@@ -304,6 +304,7 @@ h1 .script{font-family:var(--script);font-size:22px;color:var(--pink);font-weigh
       </div>
       <div class="tools" style="margin-bottom:16px">
         <button class="btn on" onclick="openProductForm()">＋ 新增商品</button>
+        <button class="btn" onclick="migrateImages()" title="把舊的內嵌圖片搬到圖片空間，只需做一次">🧳 搬移舊圖片</button>
         <button class="btn" onclick="loadProducts()" title="重新整理">🔄 重新整理</button>
       </div>
       <div id="prodList"></div>
@@ -985,8 +986,10 @@ function tabsOfItem(it){
 function setTodoTab(t){ todoTab = t; todoFilterOpen = false; render(); }
 function toggleTodoFilter(){ todoFilterOpen = !todoFilterOpen; render(); }
 
+const PROD_LIGHT = 'id,name,tab,series,series_code,price,stock,emoji,descr,thumb,shelf_on,shelf_off,on_sale,sale_price,active,sort';
 async function loadProducts(){
-  const { data, error } = await sb.from('products').select('*').order('sort',{ascending:true}).order('id',{ascending:true});
+  // 只抓輕量欄位（大圖、詳情圖等點「編輯」才抓），避免每次載入就把整張表搬下來吃流量
+  const { data, error } = await sb.from('products').select(PROD_LIGHT).order('sort',{ascending:true}).order('id',{ascending:true});
   if(error){
     if((error.message||'').toLowerCase().includes('jwt')){ showLogin(); return; }
     $('prodList').innerHTML = `<div class="empty"><div class="e">⚠️</div>讀取商品失敗：${error.message}</div>`; return;
@@ -1012,7 +1015,7 @@ function renderProducts(){
   if(products.length===0){ el.innerHTML=`<div class="empty"><div class="e">🛍</div>還沒有商品，點「＋ 新增商品」開始吧～</div>`; return; }
   el.innerHTML = products.map((p,pi)=>{
     const st=prodState(p);
-    const img = p.image_url ? `<img src="${p.image_url}" class="pthumb" alt=""/>` : `<div class="pthumb emoji">${p.emoji||'🎀'}</div>`;
+    const img = p.thumb ? `<img src="${p.thumb}" class="pthumb" alt="" loading="lazy"/>` : `<div class="pthumb emoji">${p.emoji||'🎀'}</div>`;
     const ser = p.series ? ' ・ '+p.series+(p.series_code?'（'+p.series_code+'）':'') : '';
     const sale = p.on_sale ? ' <span class="pstate on" style="background:#ffe6ef;color:#c94f78">🏷️優惠</span>' : '';
     const active = p.active!==false;
@@ -1057,12 +1060,17 @@ function fillForm(p){
 }
 function toggleSaleRow(){ $('saleRow').style.display = $('p_onsale').checked ? '' : 'none'; }
 function openProductForm(){ editingId=null; $('prodModalTitle').textContent='新增商品'; fillForm({}); $('prodModal').style.display='flex'; }
-function editProduct(id){ const p=products.find(x=>x.id===id); if(!p) return; editingId=id; $('prodModalTitle').textContent='編輯商品'; fillForm(p); $('prodModal').style.display='flex'; }
+async function editProduct(id){
+  const p=products.find(x=>x.id===id); if(!p) return;
+  const { data, error } = await sb.from('products').select('image_url,detail,detail_images').eq('id',id).maybeSingle();
+  if(error){ showToast('讀取商品失敗：'+error.message); return; }
+  editingId=id; $('prodModalTitle').textContent='編輯商品'; fillForm({...p, ...(data||{})}); $('prodModal').style.display='flex';
+}
 function closeProductForm(){ $('prodModal').style.display='none'; }
 // 本地把圖片壓小成 data URL（走已驗證正常的 PostgREST 路徑，繞開 Storage 認證問題）
 function srcToJpeg(src, max, q){
   return new Promise((resolve,reject)=>{
-    const img = new Image();
+    const img = new Image(); img.crossOrigin = 'anonymous';   // 讓 Storage 網址的圖也能重新壓縮
     img.onload = () => {
       let w = img.naturalWidth, h = img.naturalHeight;
       if(w > h && w > max){ h = Math.round(h*max/w); w = max; }
@@ -1084,21 +1092,36 @@ function fileToDataUrl(file){
   });
 }
 async function compressImage(file, max, q){ return srcToJpeg(await fileToDataUrl(file), max, q); }
+// 圖片放 Supabase Storage（公開桶 product-images），資料表只存網址；絕不再把 base64 塞進資料表
+const IMG_BUCKET = 'product-images';
+async function dataUrlToStorage(dataUrl, prefix){
+  const blob = await (await fetch(dataUrl)).blob();
+  const path = `${prefix}/${Date.now()}-${Math.random().toString(36).slice(2,8)}.jpg`;
+  const { error } = await sb.storage.from(IMG_BUCKET).upload(path, blob, { contentType:'image/jpeg', cacheControl:'31536000', upsert:false });
+  if(error) throw new Error('圖片上傳失敗：'+error.message);
+  return sb.storage.from(IMG_BUCKET).getPublicUrl(path).data.publicUrl;
+}
+const isDataUrl = u => typeof u==='string' && u.startsWith('data:');
 async function uploadImage(input){
   const file = input.files && input.files[0]; if(!file) return;
   $('p_imgstatus').textContent='處理中…';
   try{
     const dataUrl = await fileToDataUrl(file);
-    pImageUrl = await srcToJpeg(dataUrl, 800, 0.72);   // 詳情大圖（點進去才載）
-    pThumb    = await srcToJpeg(dataUrl, 320, 0.55);   // 商品牆縮圖（開店只載這個）
+    const big   = await srcToJpeg(dataUrl, 800, 0.72);   // 詳情大圖（點進去才載）
+    const small = await srcToJpeg(dataUrl, 320, 0.55);   // 商品牆縮圖（開店只載這個）
+    $('p_imgstatus').textContent='上傳中…';
+    pImageUrl = await dataUrlToStorage(big, 'main');
+    pThumb    = await dataUrlToStorage(small, 'thumb');
   }catch(e){ $('p_imgstatus').textContent='圖片處理失敗：'+(e.message||e); return; }
   $('p_imgprev').src=pImageUrl; $('p_imgprev').style.display='block';
-  $('p_imgstatus').textContent='已載入 ✓（縮圖 '+Math.round(pThumb.length*0.75/1024)+'KB／大圖 '+Math.round(pImageUrl.length*0.75/1024)+'KB）';
+  $('p_imgstatus').textContent='已上傳 ✓';
 }
 async function addDetailImages(input){
   const files = [...(input.files||[])]; if(!files.length) return;
   $('p_detstatus').textContent='處理中…';
-  for(const f of files){ try{ detailImages.push(await compressImage(f, 1000, 0.72)); }catch(e){} }
+  let fail=0;
+  for(const f of files){ try{ detailImages.push(await dataUrlToStorage(await compressImage(f, 1000, 0.72), 'detail')); }catch(e){ fail++; } }
+  if(fail) showToast(fail+' 張上傳失敗，請再試一次');
   input.value=''; renderDetImgs();
   $('p_detstatus').textContent='目前 '+detailImages.length+' 張';
 }
@@ -1121,7 +1144,12 @@ async function saveProduct(){
     if(salePrice>=price){ showToast('優惠價要低於原價'); $('p_saleprice').focus(); return; }
   }
   // 舊商品沒有縮圖時，直接從既有大圖產一張（不用重新上傳）
-  if(pImageUrl && !pThumb){ try{ pThumb = await srcToJpeg(pImageUrl, 320, 0.55); }catch(e){} }
+  try{
+    if(pImageUrl && !pThumb) pThumb = await dataUrlToStorage(await srcToJpeg(pImageUrl, 320, 0.55), 'thumb');
+    if(isDataUrl(pImageUrl)) pImageUrl = await dataUrlToStorage(pImageUrl, 'main');
+    if(isDataUrl(pThumb))    pThumb    = await dataUrlToStorage(pThumb, 'thumb');
+    for(let i=0;i<detailImages.length;i++) if(isDataUrl(detailImages[i])) detailImages[i] = await dataUrlToStorage(detailImages[i], 'detail');
+  }catch(e){ showToast(e.message||String(e)); return; }
   const tabs = getSelectedTabs();
   if(tabs.length===0){ showToast('請至少選一個頁籤'); return; }
   const row={
@@ -1148,6 +1176,25 @@ async function saveProduct(){
 
   if(error){ showToast('儲存失敗：'+error.message); return; }
   closeProductForm(); showToast(editingId?'已更新商品 🎀':'已新增商品 🎀'); loadProducts();
+}
+async function migrateImages(){
+  if(!confirm('把舊商品的圖片搬到圖片空間？（只需做一次，約 1～3 分鐘，過程中請勿關頁）')) return;
+  const { data:ids, error } = await sb.from('products').select('id'); if(error){ showToast('讀取失敗：'+error.message); return; }
+  let moved=0, done=0, fail=0;
+  for(const {id} of ids){
+    done++; showToast(`搬移中 ${done}/${ids.length}…`);
+    try{
+      const { data:r, error:e1 } = await sb.from('products').select('image_url,thumb,detail_images').eq('id',id).single(); if(e1) throw e1;
+      const upd={};
+      if(isDataUrl(r.image_url)) upd.image_url = await dataUrlToStorage(r.image_url, 'main');
+      if(isDataUrl(r.thumb)) upd.thumb = await dataUrlToStorage(r.thumb, 'thumb');
+      else if(!r.thumb && (upd.image_url||r.image_url)) upd.thumb = await dataUrlToStorage(await srcToJpeg(upd.image_url||r.image_url, 320, 0.55), 'thumb');
+      const di = Array.isArray(r.detail_images) ? r.detail_images : [];
+      if(di.some(isDataUrl)){ upd.detail_images = []; for(const u of di) upd.detail_images.push(isDataUrl(u) ? await dataUrlToStorage(u,'detail') : u); }
+      if(Object.keys(upd).length){ const { error:e2 } = await sb.from('products').update(upd).eq('id',id); if(e2) throw e2; moved++; }
+    }catch(e){ fail++; console.error('搬移失敗 id='+id, e); }
+  }
+  alert(`完成：${moved} 個商品已搬移${fail?`，${fail} 個失敗（可再按一次重試）`:''}`); loadProducts();
 }
 // 把目前 products 陣列順序寫回 DB 的 sort（只更新有變動的列）
 async function persistOrder(){
