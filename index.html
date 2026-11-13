@@ -750,11 +750,11 @@ const sb = (window.supabase && SUPABASE_URL) ? window.supabase.createClient(SUPA
 // 透過伺服器函式 place_order 原子下單：由 DB 鎖定並核對庫存，防止兩人同時搶最後一件都成功
 // 回傳 {ok:true} / {ok:false,reason:'sold_out',product_id,remaining} / {ok:false,reason:'network'}
 async function saveOrderToCloud(o){
-  if(!sb) return {ok:true};   // 沒雲端連線（CDN 被擋等極端狀況）→ 不阻擋，仍保留本機單
+  if(!sb) return {ok:false, reason:'network'};   // 連不上雲端就不能假裝成功，否則攤主收不到這張單
   try{
     const payload = {
       no:o.no, name:o.name, ig:o.ig, email:o.email, note:o.note, last5:o.last5,
-      items:o.items, total:o.total, status:o.status,
+      items:(o.items||[]).map(({img, ...rest})=>rest), total:o.total, status:o.status,   // 不把商品圖存進訂單（避免撐大訂單表吃流量）
       discount_code:o.discount_code||null, discount_amount:o.discount_amount||0
     };
     const { data, error } = await sb.rpc('place_order', { p_order: payload });
